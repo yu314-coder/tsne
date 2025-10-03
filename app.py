@@ -7,7 +7,7 @@ from tqdm import tqdm
 import plotly.graph_objects as go
 
 try:
-    from scipy.optimize import least_squares
+    from scipy.optimize import root
     SCIPY_OK = True
 except Exception:
     SCIPY_OK = False
@@ -44,10 +44,16 @@ with st.sidebar:
         st.info(f"Star config: ({n_close}, {n_far}) = {n_close} points at distance 1 from each other, {n_far} point(s) at distance {d_star} from all others")
 
     sigma = st.number_input("Gaussian σ for P", min_value=1e-9, value=1.0, step=0.1, format="%.6f")
-    iters = st.number_input("Max solver evaluations", min_value=200, value=50000, step=1000)
-    gtol = st.number_input("Gradient tolerance (smaller = more precise)", min_value=1e-20, value=1e-12, format="%.2e", step=1e-13)
+
+    solver_method = st.selectbox(
+        "Root-finding method",
+        ["hybr", "lm", "broyden1", "broyden2", "anderson", "krylov"],
+        help="hybr=Powell hybrid (default), lm=Levenberg-Marquardt, broyden/anderson/krylov=quasi-Newton methods"
+    )
+
+    tol = st.number_input("Solution tolerance (smaller = more precise)", min_value=1e-20, value=1e-10, format="%.2e", step=1e-11)
+    iters = st.number_input("Max solver iterations", min_value=100, value=10000, step=100)
     show_mats = st.checkbox("Show full P and Q matrices", value=False)
-    verbose = st.checkbox("Show solver progress", value=False)
     solve_btn = st.button("Solve: dC/dy_i = 0")
 
 # --- Build two-value P matrix ---
@@ -202,27 +208,27 @@ if solve_btn:
         st.error("SciPy is required. Please ensure scipy is available in the environment.")
     else:
         status_text = st.empty()
-        progress_placeholder = st.empty() if verbose else None
-        status_text.text("Solving: dC/dy_i = 0...")
+        status_text.text("Solving system: dC/dy_i = 0 for all i...")
 
         Y0 = init_ngon(n, radius=1.0, jitter=1e-2)
 
-        res = least_squares(
+        # Use root finder to solve the nonlinear system dC/dy_i = 0
+        options = {'maxiter': int(iters)}
+        if solver_method in ['hybr', 'lm']:
+            options['xtol'] = tol
+            options['ftol'] = tol
+
+        res = root(
             fun=residuals,
             x0=Y0.reshape(-1),
-            method="trf",
-            xtol=1e-20,      # Very tight position tolerance
-            ftol=1e-20,      # Very tight function tolerance
-            gtol=gtol,       # User-specified gradient tolerance (key for dC/dy_i = 0)
-            max_nfev=int(iters),
-            verbose=2 if verbose else 0,
-            loss='linear',   # Use linear loss for better convergence
-            tr_solver='lsmr' # Use LSMR for large problems
+            method=solver_method,
+            tol=tol,
+            options=options
         )
 
         Yhat = res.x.reshape(n,2)
 
-        status_text.text("Solution found!")
+        status_text.text("Root finding complete!")
         solution = {"Y": Yhat, "info": res, "Y0": Y0}
 
 if solution is not None and solution["Y"] is not None:
@@ -232,32 +238,39 @@ if solution is not None and solution["Y"] is not None:
     Cval = float(np.sum(kl_terms(Y)))
 
     st.subheader("Solution diagnostics")
-    st.write("**Gradient formula:** dC/dy_i = 4∑_{j≠i}(p_ij-q_ij)(y_i-y_j)/(1+||y_i-y_j||²)")
-    st.write("Solver finds Y where **dC/dy_i = 0** for all i. C(Y) is shown for reference (not constrained to 0).")
+    st.write("**System of equations:** dC/dy_i = 4∑_{j≠i}(p_ij-q_ij)(y_i-y_j)/(1+||y_i-y_j||²) = 0 for all i")
+    st.write("Root finder solves this nonlinear system directly (not optimization). C(Y) is shown for reference.")
     st.write("")
 
     # Compute per-point gradient norms to show individual convergence
     gvec_2d = gvec.reshape(n, 2)
     per_point_grad_norms = np.linalg.norm(gvec_2d, axis=1)
 
+    # Get iteration count (if available)
+    nit = getattr(solution["info"], 'nit', 'N/A')
+    nfev = getattr(solution["info"], 'nfev', 'N/A')
+
     st.write(pd.DataFrame([{
         "KL cost C(Y)": Cval,
-        "||dC/dy||₂": float(norm(gvec)),
+        "||dC/dy||₂ (residual norm)": float(norm(gvec)),
         "max |dC/dy_i|": float(np.max(np.abs(gvec))),
         "max ||dC/dy_i||₂ (per point)": float(np.max(per_point_grad_norms)),
-        "function evals used": solution["info"].nfev,
-        "max function evals": int(iters),
-        "solver status": solution["info"].status,
+        "iterations": nit,
+        "function evals": nfev,
+        "solver success": solution["info"].success,
         "message": solution["info"].message
     }]))
 
     # Show warning if solver didn't converge well
-    if float(norm(gvec)) > 1e-6:
-        st.warning(f"⚠️ Gradient norm {float(norm(gvec)):.2e} is high. Consider increasing max solver evaluations or adjusting gradient tolerance.")
-    elif float(norm(gvec)) > gtol * 10:
-        st.info(f"ℹ️ Gradient norm {float(norm(gvec)):.2e} is above target tolerance {gtol:.2e}. Solver may have stopped early.")
+    residual_norm = float(norm(gvec))
+    if not solution["info"].success:
+        st.error(f"❌ Solver failed to converge. Residual: {residual_norm:.2e}. Try different method or increase iterations.")
+    elif residual_norm > 1e-6:
+        st.warning(f"⚠️ Residual norm {residual_norm:.2e} is high. Solution may not satisfy dC/dy_i=0. Try different method or tighter tolerance.")
+    elif residual_norm > tol * 100:
+        st.info(f"ℹ️ Residual norm {residual_norm:.2e} is above target tolerance {tol:.2e}. Consider tighter tolerance.")
     else:
-        st.success(f"✓ Achieved gradient norm {float(norm(gvec)):.2e} (target: {gtol:.2e})")
+        st.success(f"✓ Achieved residual norm {residual_norm:.2e} (tolerance: {tol:.2e})")
 
     st.subheader("Low-dimensional embedding: pairwise distances")
 
