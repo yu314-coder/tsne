@@ -44,8 +44,10 @@ with st.sidebar:
         st.info(f"Star config: ({n_close}, {n_far}) = {n_close} points at distance 1 from each other, {n_far} point(s) at distance {d_star} from all others")
 
     sigma = st.number_input("Gaussian σ for P", min_value=1e-9, value=1.0, step=0.1, format="%.6f")
-    iters = st.number_input("Max solver evaluations", min_value=200, value=5000, step=100)
+    iters = st.number_input("Max solver evaluations", min_value=200, value=50000, step=1000)
+    gtol = st.number_input("Gradient tolerance (smaller = more precise)", min_value=1e-20, value=1e-12, format="%.2e", step=1e-13)
     show_mats = st.checkbox("Show full P and Q matrices", value=False)
+    verbose = st.checkbox("Show solver progress", value=False)
     solve_btn = st.button("Solve: dC/dy_i = 0")
 
 # --- Build two-value P matrix ---
@@ -200,6 +202,7 @@ if solve_btn:
         st.error("SciPy is required. Please ensure scipy is available in the environment.")
     else:
         status_text = st.empty()
+        progress_placeholder = st.empty() if verbose else None
         status_text.text("Solving: dC/dy_i = 0...")
 
         Y0 = init_ngon(n, radius=1.0, jitter=1e-2)
@@ -208,9 +211,13 @@ if solve_btn:
             fun=residuals,
             x0=Y0.reshape(-1),
             method="trf",
-            xtol=1e-15, ftol=1e-15, gtol=1e-15,
+            xtol=1e-20,      # Very tight position tolerance
+            ftol=1e-20,      # Very tight function tolerance
+            gtol=gtol,       # User-specified gradient tolerance (key for dC/dy_i = 0)
             max_nfev=int(iters),
-            verbose=0
+            verbose=2 if verbose else 0,
+            loss='linear',   # Use linear loss for better convergence
+            tr_solver='lsmr' # Use LSMR for large problems
         )
 
         Yhat = res.x.reshape(n,2)
@@ -228,13 +235,29 @@ if solution is not None and solution["Y"] is not None:
     st.write("**Gradient formula:** dC/dy_i = 4∑_{j≠i}(p_ij-q_ij)(y_i-y_j)/(1+||y_i-y_j||²)")
     st.write("Solver finds Y where **dC/dy_i = 0** for all i. C(Y) is shown for reference (not constrained to 0).")
     st.write("")
+
+    # Compute per-point gradient norms to show individual convergence
+    gvec_2d = gvec.reshape(n, 2)
+    per_point_grad_norms = np.linalg.norm(gvec_2d, axis=1)
+
     st.write(pd.DataFrame([{
         "KL cost C(Y)": Cval,
         "||dC/dy||₂": float(norm(gvec)),
         "max |dC/dy_i|": float(np.max(np.abs(gvec))),
+        "max ||dC/dy_i||₂ (per point)": float(np.max(per_point_grad_norms)),
+        "function evals used": solution["info"].nfev,
+        "max function evals": int(iters),
         "solver status": solution["info"].status,
         "message": solution["info"].message
     }]))
+
+    # Show warning if solver didn't converge well
+    if float(norm(gvec)) > 1e-6:
+        st.warning(f"⚠️ Gradient norm {float(norm(gvec)):.2e} is high. Consider increasing max solver evaluations or adjusting gradient tolerance.")
+    elif float(norm(gvec)) > gtol * 10:
+        st.info(f"ℹ️ Gradient norm {float(norm(gvec)):.2e} is above target tolerance {gtol:.2e}. Solver may have stopped early.")
+    else:
+        st.success(f"✓ Achieved gradient norm {float(norm(gvec)):.2e} (target: {gtol:.2e})")
 
     st.subheader("Low-dimensional embedding: pairwise distances")
 
