@@ -1,402 +1,493 @@
-import streamlit as st
+import io
 import numpy as np
 import pandas as pd
-from math import exp, log, pi, cos, sin
-from numpy.linalg import norm
-from tqdm import tqdm
+import streamlit as st
+from sklearn.manifold import TSNE
 import plotly.graph_objects as go
 
-try:
-    from scipy.optimize import root
-    SCIPY_OK = True
-except Exception:
-    SCIPY_OK = False
+st.set_page_config(page_title="Interactive t-SNE", layout="wide")
+st.title("t-SNE Projection to 2 Dimensions")
 
-st.set_page_config(page_title="Solve t-SNE: dC/dy=0", layout="wide")
-
-st.title("Two-distance t-SNE: solve $dC/dy_i=0$ from definitions")
-
-st.markdown(
-    'This app uses **only** the definitions of $p_{ij}$, $q_{ij}(Y)$, and the t-SNE gradient $dC/dy_i = 4\sum_{j\\neq i}(p_{ij}-q_{ij})\\frac{y_i-y_j}{1+||y_i-y_j||^2}$.'
-)
-st.markdown(
-    'Fixed initialization: **n distinct points** $Y_0$ (regular $n$-gon with fixed jitter pattern). Solver finds Y where $dC/dy_i=0$ for all i (critical point of KL cost).'
+st.write(
+    "Generate n points with equal pairwise distances in R^n dimensional space (regular simplex) and project them to 2D using t-SNE."
 )
 
-with st.sidebar:
-    st.header("Inputs")
-    n = st.number_input("n (≥ 4)", min_value=4, value=8, step=1)
+n_points = st.slider("Number of points (n)", min_value=3, max_value=500, value=4, step=1)
 
-    # Configuration selection
-    config_type = st.selectbox(
-        "Distance configuration",
-        ["Random pairs", "Star configuration"],
-        help="Random: β fraction of pairs at distance a. Star: (n-k, k) split with k points at distance d from all others, remaining at distance 1"
+point_generation_mode = st.radio(
+    "Point generation method",
+    ("Regular simplex (all distances equal)", "Custom: x₁...x_(n-1) distance=1, x_n distance=d to all others", "Custom high-dimensional input points"),
+    index=0,
+)
+
+custom_distance = None
+custom_input_text = None
+
+if point_generation_mode == "Custom: x₁...x_(n-1) distance=1, x_n distance=d to all others":
+    custom_distance = st.number_input("Distance d from x_n to other points", min_value=0.1, max_value=100.0, value=2.0, step=0.1)
+elif point_generation_mode == "Custom high-dimensional input points":
+    custom_input_example = "1,0,0,0\n0,1,0,0\n0,0,1,0\n0,0,0,1"
+    custom_input_text = st.text_area(
+        "Custom high-dimensional input points (x)",
+        value=custom_input_example,
+        height=200,
+        help="Provide comma- or tab-separated values per row. Each row is one point x_i. Number of rows determines n.",
+        key="custom_input_points",
     )
 
-    if config_type == "Random pairs":
-        beta = st.slider("β (fraction of unordered pairs at distance a)", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
-        a = st.number_input("a (> 0)", min_value=1e-6, value=2.0, step=0.1, format="%.6f")
-    else:  # Star configuration
-        n_far = st.number_input("Number of points at distance d", min_value=1, max_value=int(n)-1, value=1, step=1)
-        d_star = st.number_input("d (distance for far points, > 0)", min_value=1e-6, value=2.0, step=0.1, format="%.6f")
-        n_close = int(n) - n_far
-        st.info(f"Star config: ({n_close}, {n_far}) = {n_close} points at distance 1 from each other, {n_far} point(s) at distance {d_star} from all others")
+initialization_mode = st.radio(
+    "Initialization",
+    ("Random (default)", "Provide custom 2D starting coordinates"),
+    index=0,
+)
 
-    sigma = st.number_input("Gaussian σ for P", min_value=1e-9, value=1.0, step=0.1, format="%.6f")
-
-    solver_method = st.selectbox(
-        "Root-finding method",
-        ["hybr", "lm", "broyden1", "broyden2", "anderson", "krylov"],
-        help="hybr=Powell hybrid (default), lm=Levenberg-Marquardt, broyden/anderson/krylov=quasi-Newton methods"
+custom_init_text = None
+if initialization_mode == "Provide custom 2D starting coordinates":
+    custom_init_example = "0,0\n1,0\n0.5,0.866\n0.5,0.289"
+    custom_init_text = st.text_area(
+        "Custom initial 2D coordinates (y₀)",
+        value=custom_init_example,
+        height=120,
+        help="Provide two comma- or tab-separated values per row. Number of rows must match n.",
+        key="custom_init_input",
     )
 
-    tol = st.number_input("Solution tolerance (smaller = more precise)", min_value=1e-20, value=1e-10, format="%.2e", step=1e-11)
-    iters = st.number_input("Max solver iterations", min_value=100, value=10000, step=100)
-    show_mats = st.checkbox("Show full P and Q matrices", value=False)
-    solve_btn = st.button("Solve: dC/dy_i = 0")
+use_custom_sigma = st.checkbox("Use custom σ (ignore perplexity)", value=False, help="When checked, uses a custom sigma value for all points instead of tuning it to match perplexity")
 
-# --- Build two-value P matrix ---
-N = int(n*(n-1))       # ordered pairs
-M = int(n*(n-1)//2)    # unordered pairs
-t = 1.0 / N
+custom_sigma = 2**(-0.5)
+if use_custom_sigma:
+    custom_sigma = st.number_input("Custom σ value", min_value=0.0, max_value=100.0, value=2**(-0.5), format="%.10f", step=0.01, help="Default is 2^(-0.5) ≈ 0.7071067812")
 
-rng = np.random.default_rng(42)  # Fixed seed for reproducibility
+col1, col2 = st.columns(2)
+with col1:
+    # Default perplexity should be at most n-1
+    default_perp = min(3, max(1, n_points - 1))
+    perplexity = st.slider("Perplexity", min_value=1, max_value=100, value=default_perp, step=1, disabled=use_custom_sigma)
+    if perplexity >= n_points and not use_custom_sigma:
+        st.warning(f"⚠️ Perplexity ({perplexity}) should be less than n ({n_points}). Maximum meaningful perplexity is {n_points-1}.")
+    learning_rate = st.number_input("Learning rate", min_value=0.0, max_value=1000.0, value=0.0001, format="%.25f", step=0.00001)
+with col2:
+    iterations = st.slider("Number of iterations", min_value=250, max_value=2000000, value=1000, step=50)
+    metric = st.selectbox("Distance metric", ["euclidean", "cosine", "manhattan"])
 
-if config_type == "Random pairs":
-    # Random assignment of β fraction to distance a
-    pairs = [(i,j) for i in range(n) for j in range(i+1, n)]
-    idx = np.arange(M); rng.shuffle(idx)
-    m_a = int(round(beta * M))
-    a_idx = set(idx[:m_a].tolist())
-    is_a = np.zeros((n,n), dtype=bool)
-    for k, (i,j) in enumerate(pairs):
-        if k in a_idx:
-            is_a[i,j] = True; is_a[j,i] = True
+run_tsne = st.button("Compute t-SNE")
 
-    rho = exp(-(a*a - 1.0)/(2.0*sigma*sigma))
-    den = (1.0 - beta) + beta * rho
-    p1 = 1.0 / (N * den)
-    pa = rho / (N * den)
+@st.cache_data(show_spinner=False)
+def parse_input(text: str) -> pd.DataFrame:
+    data = io.StringIO(text.strip())
+    try:
+        df = pd.read_csv(data, sep=None, engine="python", header=None)
+    except pd.errors.ParserError:
+        df = pd.read_csv(io.StringIO(text.strip()), sep=r"\s+", header=None)
+    if df.empty:
+        raise ValueError("No data found.")
+    if df.shape[0] < 2:
+        raise ValueError("Need at least two points.")
+    return df
 
-    P = np.where(is_a, pa, p1).astype(float)
-    # Add small epsilon to avoid exactly zero probabilities
-    P = np.maximum(P, 1e-300)
+@st.cache_data(show_spinner=False)
+def generate_equidistant_points(n: int) -> pd.DataFrame:
+    """Generate n points where all pairwise distances are exactly equal (regular simplex)."""
+    # Simple construction: use standard basis vectors in R^n, center them
+    # This creates a regular simplex with all pairwise distances equal
 
-else:  # Star configuration
-    # n_close points at distance 1, n_far point(s) at distance d_star
-    far_indices = list(range(n - int(n_far), n))  # Last n_far points are "far"
-    close_indices = list(range(n - int(n_far)))   # First n_close points are "close"
+    points = np.eye(n)  # n points in R^n (standard basis vectors)
+    points = points - np.mean(points, axis=0)  # Center at origin
 
-    is_star = np.zeros((n,n), dtype=bool)
+    # Scale so all pairwise distances equal 1
+    dist = np.linalg.norm(points[0] - points[1])
+    if dist > 0:
+        points = points / dist
 
-    # Far points to close points at distance d_star
-    for i in far_indices:
-        for j in close_indices:
-            is_star[i,j] = True
-            is_star[j,i] = True
+    return pd.DataFrame(points)
 
-    # Far points to each other at distance d_star
-    for i in far_indices:
-        for j in far_indices:
-            if i != j:
-                is_star[i,j] = True
+@st.cache_data(show_spinner=False)
+def generate_custom_distance_points(n: int, d_custom: float) -> pd.DataFrame:
+    """Generate n points where x_1...x_(n-1) have distance 1, and x_n has distance d to all others."""
+    if n < 2:
+        raise ValueError("Need at least 2 points")
 
-    # All close points to each other at distance 1 (is_star remains False)
+    if n == 2:
+        # Special case: just two points at distance d_custom
+        points = np.zeros((2, 2))
+        points[0] = [0.0, 0.0]
+        points[1] = [d_custom, 0.0]
+        return pd.DataFrame(points)
 
-    rho_star = exp(-(d_star*d_star - 1.0)/(2.0*sigma*sigma))
-    # Count pairs at distance d_star: close<->far + far<->far
-    n_close_far_pairs = 2 * int(n_close) * int(n_far)  # ordered pairs close<->far
-    n_far_far_pairs = int(n_far) * (int(n_far) - 1)    # ordered pairs far<->far
-    n_star_pairs = n_close_far_pairs + n_far_far_pairs
-    n_unit_pairs = N - n_star_pairs  # remaining pairs (close<->close) at distance 1
+    # Generate first n-1 points forming regular simplex with distance 1
+    m = n - 1
+    simplex_points = np.eye(m)  # m points in R^m
+    simplex_points = simplex_points - np.mean(simplex_points, axis=0)  # Center
 
-    den = n_unit_pairs + n_star_pairs * rho_star
-    p1 = 1.0 / den  # distance 1 probability
-    p_star = rho_star / den  # distance d_star probability
+    # Scale to distance 1
+    edge_dist = np.linalg.norm(simplex_points[0] - simplex_points[1])
+    if edge_dist > 0:
+        simplex_points = simplex_points / edge_dist
 
-    P = np.where(is_star, p_star, p1).astype(float)
-    # Add small epsilon to avoid exactly zero probabilities
-    P = np.maximum(P, 1e-300)
+    # Calculate centroid (should be zero, but calculate for safety)
+    centroid = np.mean(simplex_points, axis=0)
 
-np.fill_diagonal(P, 0.0)
+    # Calculate distance from centroid to any vertex
+    r = np.linalg.norm(simplex_points[0] - centroid)
 
-st.subheader("High-dimensional P (two values, ordered pairs)")
-st.markdown("**Note:** We define P directly from pairwise distances (no explicit x_i needed). P represents the target similarity structure.")
-
-if config_type == "Random pairs":
-    st.write(f"**Selected pairs at distance {a}:**")
-    selected_pairs = [(i,j) for k, (i,j) in enumerate(pairs) if k in a_idx]
-    if len(selected_pairs) <= 20:
-        st.write(selected_pairs)
+    # Place x_n at distance d_custom from all simplex vertices
+    # Use one additional dimension for placement
+    # Pythagorean theorem: d_custom^2 = r^2 + h^2
+    if d_custom**2 < r**2:
+        h = 0  # Best approximation if d_custom too small
     else:
-        st.write(f"Showing first 20 of {len(selected_pairs)} pairs: {selected_pairs[:20]}")
-    st.write("")
-    st.write(pd.DataFrame([
-        {"pair type": "distance 1", "p_ij": p1, "count (ordered)": int((1.0-beta)*N)},
-        {"pair type": f"distance {a}", "p_ij": pa, "count (ordered)": int(beta*N)},
-        {"pair type": "total", "sum p_ij": (1.0-beta)*N*p1 + beta*N*pa, "count (ordered)": N},
-    ]))
-else:  # Star configuration
-    st.write(f"**Selected indices:**")
-    st.write(f"- Close points (distance 1 among themselves): {close_indices}")
-    st.write(f"- Far points (distance {d_star} to close & to each other): {far_indices}")
-    st.write("")
-    st.write(pd.DataFrame([
-        {"pair type": "distance 1 (close-close)", "p_ij": p1, "count (ordered)": n_unit_pairs},
-        {"pair type": f"distance {d_star} (close-far)", "p_ij": p_star, "count (ordered)": n_close_far_pairs},
-        {"pair type": f"distance {d_star} (far-far)", "p_ij": p_star, "count (ordered)": n_far_far_pairs},
-        {"pair type": "total", "sum p_ij": n_unit_pairs*p1 + n_star_pairs*p_star, "count (ordered)": N},
-    ]))
+        h = np.sqrt(d_custom**2 - r**2)
 
-if show_mats:
-    st.write("### Matrix P (high-dimensional probabilities p_ij)")
-    st.dataframe(pd.DataFrame(P))
+    # Embed in R^(m+1) = R^n
+    full_points = np.zeros((n, n))
+    full_points[:m, :m] = simplex_points  # First n-1 points
+    full_points[m, :m] = centroid  # x_n at centroid in first m dimensions
+    full_points[m, m] = h  # Offset in new dimension
 
-# --- Initialization: n DISTINCT points (regular n-gon + fixed jitter) ---
-def init_ngon(n, radius=1.0, jitter=1e-3):
-    angles = np.linspace(0.0, 2.0*pi, n, endpoint=False)
-    Y = np.stack([radius*np.cos(angles), radius*np.sin(angles)], axis=1)
-    # Add fixed jitter pattern (deterministic)
-    jitter_pattern = np.array([[np.cos(2*pi*i/n + 0.5), np.sin(2*pi*i/n + 0.5)] for i in range(n)])
-    Y += jitter * jitter_pattern
-    return Y
+    return pd.DataFrame(full_points)
 
-# --- Definitions of q, gradient, KL ---
-def compute_W_Q(Y):
-    # center to remove translation redundancy
-    Y = Y - np.mean(Y, axis=0, keepdims=True)
-    D2 = np.sum((Y[:,None,:] - Y[None,:,:])**2, axis=2)
-    np.fill_diagonal(D2, 0.0)
-    W = 1.0 / (1.0 + D2)
-    np.fill_diagonal(W, 0.0)
-    Z = np.sum(W)
-    Q = W / Z if Z > 0 else np.zeros_like(W)
-    return W, Q
-
-def grad_flat(Y):
-    W, Q = compute_W_Q(Y)
-    G = np.zeros_like(Y)
-    for i in range(n):
-        diff = Y[i] - Y            # n×2
-        coeff = (P[i] - Q[i]) * W[i]  # n
-        G[i] = 4.0 * np.sum(coeff[:,None] * diff, axis=0)
-    return G.reshape(-1)
-
-def kl_terms(Y):
-    _, Q = compute_W_Q(Y)
-    eps = 1e-300
-    mask = ~np.eye(n, dtype=bool)
-    vecP = P[mask]
-    vecQ = Q[mask] + eps
-
-    # Handle p_ij = 0 case: 0 * log(0) = 0 by convention
-    # Only compute where p_ij > 0 to avoid numerical issues
-    result = np.zeros_like(vecP)
-    nonzero_mask = vecP > eps
-    result[nonzero_mask] = vecP[nonzero_mask] * np.log(vecP[nonzero_mask] / vecQ[nonzero_mask])
-    return result
-
-def residuals(y_flat):
-    Y = y_flat.reshape(n,2)
-    return grad_flat(Y)  # solve for dC/dy_i = 0
-
-solution = None
-
-if solve_btn:
-    if not SCIPY_OK:
-        st.error("SciPy is required. Please ensure scipy is available in the environment.")
+@st.cache_data(show_spinner=True)
+def compute_tsne(
+    df: pd.DataFrame,
+    perplexity: float,
+    learning_rate: float,
+    max_iter: int,
+    metric: str,
+    init_mode: str,
+    init_values: tuple | None,
+) -> pd.DataFrame:
+    if init_mode == "custom":
+        if init_values is None:
+            raise ValueError("Custom initialization values were not provided.")
+        init_array = np.asarray(init_values, dtype=np.float64)
+        if init_array.shape != (df.shape[0], 2):
+            raise ValueError("Custom initialization must match dataset size (rows) and have exactly two columns.")
+        init_param = init_array
     else:
-        status_text = st.empty()
-        status_text.text("Solving system: dC/dy_i = 0 for all i...")
+        init_param = "random"
 
-        Y0 = init_ngon(n, radius=1.0, jitter=1e-2)
-
-        # Use root finder to solve the nonlinear system dC/dy_i = 0
-        options = {'maxiter': int(iters)}
-        if solver_method in ['hybr', 'lm']:
-            options['xtol'] = tol
-            options['ftol'] = tol
-
-        res = root(
-            fun=residuals,
-            x0=Y0.reshape(-1),
-            method=solver_method,
-            tol=tol,
-            options=options
-        )
-
-        Yhat = res.x.reshape(n,2)
-
-        status_text.text("Root finding complete!")
-        solution = {"Y": Yhat, "info": res, "Y0": Y0}
-
-if solution is not None and solution["Y"] is not None:
-    Y = solution["Y"]
-    W, Q = compute_W_Q(Y)
-    gvec = grad_flat(Y)
-    Cval = float(np.sum(kl_terms(Y)))
-
-    st.subheader("Solution diagnostics")
-    st.write("**System of equations:** dC/dy_i = 4∑_{j≠i}(p_ij-q_ij)(y_i-y_j)/(1+||y_i-y_j||²) = 0 for all i")
-    st.write("Root finder solves this nonlinear system directly (not optimization). C(Y) is shown for reference.")
-    st.write("")
-
-    # Compute per-point gradient norms to show individual convergence
-    gvec_2d = gvec.reshape(n, 2)
-    per_point_grad_norms = np.linalg.norm(gvec_2d, axis=1)
-
-    # Get iteration count (if available)
-    nit = getattr(solution["info"], 'nit', 'N/A')
-    nfev = getattr(solution["info"], 'nfev', 'N/A')
-
-    st.write(pd.DataFrame([{
-        "KL cost C(Y)": Cval,
-        "||dC/dy||₂ (residual norm)": float(norm(gvec)),
-        "max |dC/dy_i|": float(np.max(np.abs(gvec))),
-        "max ||dC/dy_i||₂ (per point)": float(np.max(per_point_grad_norms)),
-        "iterations": nit,
-        "function evals": nfev,
-        "solver success": solution["info"].success,
-        "message": solution["info"].message
-    }]))
-
-    # Show warning if solver didn't converge well
-    residual_norm = float(norm(gvec))
-    if not solution["info"].success:
-        st.error(f"❌ Solver failed to converge. Residual: {residual_norm:.2e}. Try different method or increase iterations.")
-    elif residual_norm > 1e-6:
-        st.warning(f"⚠️ Residual norm {residual_norm:.2e} is high. Solution may not satisfy dC/dy_i=0. Try different method or tighter tolerance.")
-    elif residual_norm > tol * 100:
-        st.info(f"ℹ️ Residual norm {residual_norm:.2e} is above target tolerance {tol:.2e}. Consider tighter tolerance.")
-    else:
-        st.success(f"✓ Achieved residual norm {residual_norm:.2e} (tolerance: {tol:.2e})")
-
-    st.subheader("Low-dimensional embedding: pairwise distances")
-
-    # Compute pairwise distances
-    D = np.sqrt(np.sum((Y[:,None,:] - Y[None,:,:])**2, axis=2))
-    D_offdiag = D[~np.eye(n, dtype=bool)]
-
-    # Count unique distances
-    unique_distances = np.unique(np.round(D_offdiag, 12))  # Round to avoid floating point precision issues
-    num_unique_distances = len(unique_distances)
-
-    distance_stats = pd.DataFrame([{
-        "metric": "Pairwise distances ||y_i - y_j||",
-        "unique distance values": num_unique_distances,
-        "total pairs": len(D_offdiag),
-        "min distance": float(np.min(D_offdiag)),
-        "max distance": float(np.max(D_offdiag)),
-        "mean distance": float(np.mean(D_offdiag))
-    }])
-    st.write(distance_stats)
-
-    st.write(f"**Number of different distance values: {num_unique_distances}** (out of {len(D_offdiag)} total pairs)")
-
-    # Show all pairwise distances
-    st.write("**All pairwise distances ||y_i - y_j||:**")
-
-    # Create a dataframe with all pairwise distances
-    distance_data = []
-    for i in range(n):
-        for j in range(i+1, n):  # Only upper triangle to avoid duplicates
-            distance_data.append({
-                "i": i,
-                "j": j,
-                "||y_i - y_j||": D[i, j]
-            })
-
-    distance_df = pd.DataFrame(distance_data)
-    st.dataframe(distance_df, height=400)
-
-    # Also show Q statistics for reference
-    st.write("")
-    st.write("**Q matrix statistics (for reference):**")
-    Q_offdiag = Q[~np.eye(n, dtype=bool)]
-    st.write(f"- Formula: q_ij = w_ij / Z where w_ij = 1/(1 + ||y_i - y_j||²) and Z = Σw_ij")
-    st.write(f"- min q_ij: {float(np.min(Q_offdiag)):.10f}")
-    st.write(f"- max q_ij: {float(np.max(Q_offdiag)):.10f}")
-    st.write(f"- mean q_ij: {float(np.mean(Q_offdiag)):.10f}")
-    st.write(f"- sum q_ij: {float(np.sum(Q_offdiag)):.10f}")
-
-    if show_mats:
-        st.write("### Matrix Q (low-dimensional probabilities q_ij from solved Y)")
-        st.dataframe(pd.DataFrame(Q))
-
-    # Show initial Y_0 coordinates
-    st.subheader("Initial coordinates Y₀ (before optimization)")
-    Y0 = solution.get("Y0", None)
-    if Y0 is not None:
-        Y0_df = pd.DataFrame(Y0, columns=["y₁", "y₂"])
-        Y0_df.insert(0, "point_index", range(n))
-        if config_type == "Star configuration":
-            Y0_df["group"] = ["close" if i in close_indices else "far" for i in range(n)]
-            st.write("Initial Y₀ (regular n-gon with fixed jitter):")
-        st.dataframe(Y0_df)
-
-    # Visualization
-    st.subheader("Solved embedding Y (final coordinates)")
-
-    fig = go.Figure()
-
-    if config_type == "Star configuration":
-        # Close points
-        close_y = Y[close_indices]
-        fig.add_trace(go.Scatter(
-            x=close_y[:, 0], y=close_y[:, 1],
-            mode='markers+text',
-            marker=dict(size=12, color='blue'),
-            text=[str(i) for i in close_indices],
-            textposition="top center",
-            name='close',
-            showlegend=True
-        ))
-        # Far points
-        far_y = Y[far_indices]
-        fig.add_trace(go.Scatter(
-            x=far_y[:, 0], y=far_y[:, 1],
-            mode='markers+text',
-            marker=dict(size=12, color='red'),
-            text=[str(i) for i in far_indices],
-            textposition="top center",
-            name='far',
-            showlegend=True
-        ))
-    else:
-        fig.add_trace(go.Scatter(
-            x=Y[:, 0], y=Y[:, 1],
-            mode='markers+text',
-            marker=dict(size=12, color='blue'),
-            text=[str(i) for i in range(n)],
-            textposition="top center",
-            showlegend=False
-        ))
-
-    fig.update_layout(
-        xaxis_title="y₁",
-        yaxis_title="y₂",
-        width=700, height=700,
-        yaxis=dict(scaleanchor="x", scaleratio=1)
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        learning_rate=learning_rate,
+        max_iter=max_iter,
+        metric=metric,
+        init=init_param,
+        random_state=42,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    embedding = tsne.fit_transform(df.values)
+    return pd.DataFrame(embedding, columns=["x", "y"], index=df.index)
 
-    st.subheader("Final solved Y coordinates (y_i after optimization)")
-    Y_df = pd.DataFrame(Y, columns=["y₁", "y₂"])
-    Y_df.insert(0, "point_index i", range(n))
+# Pairwise squared Euclidean distances (vectorized) for probability and gradient calculations.
+def compute_squared_euclidean(matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    sum_sq = np.sum(np.square(matrix), axis=1, keepdims=True)
+    distances = sum_sq + sum_sq.T - 2.0 * matrix @ matrix.T
+    np.maximum(distances, 0.0, out=distances)
+    np.fill_diagonal(distances, 0.0)
+    return distances
 
-    if config_type == "Star configuration":
-        Y_df["group"] = ["close" if i in close_indices else "far" for i in range(n)]
-        st.write("Points grouped by distance configuration (where dC/dy_i = 0):")
-    else:
-        st.write("Final embedding coordinates where dC/dy_i = 0:")
+# High-dimensional joint probabilities P_ij computed to match the chosen perplexity.
+def compute_joint_probabilities(data: np.ndarray, perplexity: float, tol: float = 1e-5, max_iter: int = 50, custom_sigma: float | None = None) -> np.ndarray:
+    distances = compute_squared_euclidean(data)
+    n_samples = distances.shape[0]
+    if n_samples < 2:
+        raise ValueError("Need at least two points to compute probabilities.")
 
-    st.dataframe(Y_df)
+    target_entropy = np.log(perplexity)
+    P = np.zeros_like(distances)
 
-    st.subheader("Download results")
-    def df_to_bytes(df): return df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download P.csv", data=df_to_bytes(pd.DataFrame(P)), file_name="P.csv")
-    st.download_button("Download Q.csv", data=df_to_bytes(pd.DataFrame(Q)), file_name="Q.csv")
-    st.download_button("Download Y.csv", data=df_to_bytes(Y_df), file_name="Y.csv")
-else:
-    st.info("Click solve. Initialization uses a regular n-gon with fixed jitter so all y_i are **distinct**. The solver finds Y satisfying dC/dy_i=0 for all i (critical point of KL divergence).")
+    for i in range(n_samples):
+        mask = np.ones(n_samples, dtype=bool)
+        mask[i] = False
+        dist_i = distances[i, mask]
+
+        if custom_sigma is not None:
+            # Use custom sigma value, beta = 1/(2*sigma^2)
+            beta = 1.0 / (2.0 * custom_sigma**2)
+            p = np.exp(-dist_i * beta)
+            sum_p = np.sum(p)
+            if sum_p == 0.0:
+                p = np.full_like(dist_i, 1.0 / dist_i.size)
+            else:
+                p /= sum_p
+        else:
+            # Binary search to find beta that matches target perplexity
+            beta = 1.0
+            beta_min = -np.inf
+            beta_max = np.inf
+
+            for _ in range(max_iter):
+                p = np.exp(-dist_i * beta)
+                sum_p = np.sum(p)
+                if sum_p == 0.0:
+                    p = np.full_like(dist_i, 1.0 / dist_i.size)
+                    break
+
+                H = np.log(sum_p) + (beta * np.sum(dist_i * p) / sum_p)
+                H_diff = H - target_entropy
+
+                if abs(H_diff) < tol:
+                    p /= sum_p
+                    break
+
+                if H_diff > 0.0:
+                    beta_min = beta
+                    if np.isinf(beta_max):
+                        beta *= 2.0
+                    else:
+                        beta = 0.5 * (beta + beta_max)
+                else:
+                    beta_max = beta
+                    if np.isinf(beta_min):
+                        beta *= 0.5
+                    else:
+                        beta = 0.5 * (beta + beta_min)
+            else:
+                p = np.exp(-dist_i * beta)
+                sum_p = np.sum(p)
+                if sum_p == 0.0:
+                    p = np.full_like(dist_i, 1.0 / dist_i.size)
+                else:
+                    p /= sum_p
+
+        P[i, mask] = p
+
+    # Symmetric joint probability: p_ij = (p_j|i + p_i|j) / (2N)
+    # This formula already ensures that sum of all p_ij = 1
+    P = (P + P.T) / (2.0 * n_samples)
+    np.fill_diagonal(P, 0.0)
+    # Apply minimum threshold for numerical stability
+    P = np.maximum(P, 1e-12)
+    return P
+
+# Low-dimensional affinities Q_ij and the unnormalized Student-t kernel weights.
+def compute_low_dim_affinities(embedding: np.ndarray):
+    distances = compute_squared_euclidean(embedding)
+    # Student t-distribution: q_ij = (1 + ||y_i - y_j||²)^(-1) / Z
+    inv_distances = 1.0 / (1.0 + distances)
+    np.fill_diagonal(inv_distances, 0.0)
+    # Normalize: sum over all i≠j
+    denom = np.sum(inv_distances)
+    denom = max(denom, 1e-12)
+    Q = inv_distances / denom
+    # Apply minimum threshold for numerical stability
+    Q = np.maximum(Q, 1e-12)
+    np.fill_diagonal(Q, 0.0)
+    return Q, inv_distances
+
+# Gradient of the Kullback-Leibler divergence with respect to each embedding point.
+def compute_gradients(embedding: np.ndarray, P: np.ndarray, Q: np.ndarray, inv_distances: np.ndarray) -> np.ndarray:
+    Y = np.asarray(embedding, dtype=np.float64)
+    P = np.asarray(P, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
+    inv_distances = np.asarray(inv_distances, dtype=np.float64)
+
+    n_samples = Y.shape[0]
+    gradients = np.zeros_like(Y)
+    for i in range(n_samples):
+        diff = Y[i] - Y
+        coeff = (P[i] - Q[i]) * inv_distances[i]
+        coeff[i] = 0.0
+        gradients[i] = 4.0 * np.sum(coeff[:, None] * diff, axis=0)
+    return gradients
+
+def compute_kl_divergence(P: np.ndarray, Q: np.ndarray) -> float:
+    """Compute KL divergence between P and Q."""
+    P = np.maximum(P, 1e-12)
+    Q = np.maximum(Q, 1e-12)
+    return np.sum(P * np.log(P / Q))
+
+if run_tsne:
+    try:
+        # Generate points based on selected method
+        if point_generation_mode == "Custom: x₁...x_(n-1) distance=1, x_n distance=d to all others":
+            data_df = generate_custom_distance_points(n_points, custom_distance)
+            point_desc = f"Custom Distance Points in R^{n_points}"
+        elif point_generation_mode == "Custom high-dimensional input points":
+            data_df = parse_input(custom_input_text or "")
+            if data_df.shape[0] < 2:
+                raise ValueError("Need at least two points.")
+            point_desc = f"Custom Input Points in R^{data_df.shape[1]}"
+        else:
+            data_df = generate_equidistant_points(n_points)
+            point_desc = f"Generated Equidistant Points in R^{n_points}"
+
+        if perplexity >= data_df.shape[0]:
+            st.warning("Perplexity must be less than the number of samples.")
+        else:
+            # Display generated points
+            st.subheader(point_desc)
+            # Label points as x_1, x_2, ..., x_n and columns as coordinate dimensions (x, y, z, w, ...)
+            data_display = data_df.copy()
+            # Use x, y, z, w for first 4 dimensions, then x₅, x₆, ... for higher dimensions
+            coord_names = ['x', 'y', 'z', 'w'] + [f'x_{i+1}' for i in range(4, data_df.shape[1])]
+            data_display.columns = coord_names[:data_df.shape[1]]
+            data_display.index = [f"x_{i+1}" for i in range(len(data_display))]
+            st.dataframe(data_display)
+
+            # Display distance matrix for verification
+            distances = compute_squared_euclidean(data_df.values)
+            distances = np.sqrt(distances)  # Convert to actual distances
+            st.subheader("Pairwise Distances")
+            dist_df = pd.DataFrame(distances,
+                                   index=[f"x_{i+1}" for i in range(len(data_df))],
+                                   columns=[f"x_{i+1}" for i in range(len(data_df))])
+            st.dataframe(dist_df)
+
+            # Compute original cost C (before t-SNE)
+            sigma_to_use = custom_sigma if use_custom_sigma else None
+            p_matrix_original = compute_joint_probabilities(data_df.values, perplexity, custom_sigma=sigma_to_use)
+
+            if use_custom_sigma:
+                beta_value = 1.0 / (2.0 * custom_sigma**2)
+                st.info(f"σ is set to {custom_sigma:.10f} for all points (β = {beta_value:.10f}). Perplexity is ignored.")
+
+            init_mode_key = "random"
+            init_values_tuple: tuple | None = None
+
+            if initialization_mode == "Provide custom 2D starting coordinates":
+                custom_df = parse_input(custom_init_text or "")
+                if custom_df.shape[1] != 2:
+                    raise ValueError("Custom initial coordinates must have exactly two columns.")
+                if custom_df.shape[0] != data_df.shape[0]:
+                    raise ValueError("Custom initial coordinates must have the same number of rows as n.")
+                custom_array = custom_df.to_numpy(dtype=np.float64)
+                init_values_tuple = tuple(tuple(row) for row in custom_array)
+                init_mode_key = "custom"
+
+                # Compute initial cost with custom initialization
+                q_matrix_init, _ = compute_low_dim_affinities(custom_array)
+                cost_initial = compute_kl_divergence(p_matrix_original, q_matrix_init)
+                st.info(f"Initial Cost C (with custom y₀): {cost_initial:.6f}")
+
+            embedding_df = compute_tsne(
+                data_df,
+                perplexity,
+                learning_rate,
+                iterations,
+                metric,
+                init_mode_key,
+                init_values_tuple,
+            )
+
+            # Compute final cost C (after t-SNE)
+            q_matrix_final, _ = compute_low_dim_affinities(embedding_df.values)
+            cost_final = compute_kl_divergence(p_matrix_original, q_matrix_final)
+
+            st.success(f"Final Cost C (after t-SNE): {cost_final:.6f}")
+
+            st.subheader("t-SNE Embedding (y)")
+            embedding_display = embedding_df.copy()
+            embedding_display.columns = ["x", "y"]
+            embedding_display.index = [f"y_{i+1}" for i in range(len(embedding_display))]
+            st.dataframe(embedding_display)
+
+            # Display distance matrix for output y
+            y_distances = compute_squared_euclidean(embedding_df.values)
+            y_distances = np.sqrt(y_distances)  # Convert to actual distances
+            st.subheader("Pairwise Distances in 2D Embedding (y)")
+            y_dist_df = pd.DataFrame(y_distances,
+                                     index=[f"y_{i+1}" for i in range(len(embedding_df))],
+                                     columns=[f"y_{i+1}" for i in range(len(embedding_df))])
+            st.dataframe(y_dist_df)
+
+            # Plot 2D scatter plot with Plotly
+            fig = go.Figure()
+
+            # Add scatter points
+            fig.add_trace(go.Scatter(
+                x=embedding_df["x"],
+                y=embedding_df["y"],
+                mode='markers+text',
+                marker=dict(
+                    size=20,
+                    color=list(range(len(embedding_df))),
+                    colorscale='Viridis',
+                    line=dict(color='black', width=2),
+                    showscale=False
+                ),
+                text=[f'y_{i+1}' for i in range(len(embedding_df))],
+                textposition="top center",
+                textfont=dict(size=14, color='black', family='Arial Black'),
+                hovertemplate='<b>y_%{pointNumber|add:1}</b><br>' +
+                              'x: %{x:.6f}<br>' +
+                              'y: %{y:.6f}<br>' +
+                              '<extra></extra>',
+                showlegend=False
+            ))
+
+            # Update layout for better appearance
+            fig.update_layout(
+                title=dict(
+                    text="t-SNE 2D Embedding",
+                    font=dict(size=24, color='black', family='Arial Black'),
+                    x=0.5,
+                    xanchor='center'
+                ),
+                xaxis=dict(
+                    title=dict(text="x", font=dict(size=18, color='black', family='Arial')),
+                    showgrid=True,
+                    gridwidth=1,
+                    gridcolor='lightgray',
+                    zeroline=True,
+                    zerolinewidth=2,
+                    zerolinecolor='black'
+                ),
+                yaxis=dict(
+                    title=dict(text="y", font=dict(size=18, color='black', family='Arial')),
+                    showgrid=True,
+                    gridwidth=1,
+                    gridcolor='lightgray',
+                    zeroline=True,
+                    zerolinewidth=2,
+                    zerolinecolor='black',
+                    scaleanchor="x",
+                    scaleratio=1
+                ),
+                width=900,
+                height=800,
+                plot_bgcolor='white',
+                hovermode='closest'
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+            st.download_button(
+                label="Download embedding as CSV",
+                data=embedding_df.to_csv(index=False).encode("utf-8"),
+                file_name="tsne_embedding.csv",
+                mime="text/csv",
+            )
+
+            # Display probability matrices
+            st.subheader("High-dimensional joint probabilities P_ij")
+            p_matrix_df = pd.DataFrame(p_matrix_original,
+                                       index=[f"x_{i+1}" for i in range(len(data_df))],
+                                       columns=[f"x_{i+1}" for i in range(len(data_df))])
+            st.dataframe(p_matrix_df)
+
+            try:
+                q_matrix, inv_distances = compute_low_dim_affinities(embedding_df.values)
+
+                st.subheader("Low-dimensional affinities Q_ij")
+                q_matrix_df = pd.DataFrame(q_matrix,
+                                           index=[f"x_{i+1}" for i in range(len(data_df))],
+                                           columns=[f"x_{i+1}" for i in range(len(data_df))])
+                st.dataframe(q_matrix_df)
+
+                gradients = compute_gradients(embedding_df.values, p_matrix_original, q_matrix, inv_distances)
+                gradient_df = pd.DataFrame(gradients, columns=["∂C/∂x", "∂C/∂y"])
+                gradient_df.index = [f"y_{i+1}" for i in range(len(gradient_df))]
+
+                st.subheader("Gradient ∂C/∂y")
+                st.dataframe(gradient_df)
+                st.download_button(
+                    label="Download gradients as CSV",
+                    data=gradient_df.to_csv(index=True).encode("utf-8"),
+                    file_name="tsne_gradients.csv",
+                    mime="text/csv",
+                )
+            except Exception as grad_exc:
+                st.error(f"Could not compute gradient or probabilities: {grad_exc}")
+    except Exception as exc:
+        st.error(f"Could not compute t-SNE: {exc}")
