@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>t-SNE Explorer</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>t-SNE Explorer</h1>
+            <p class="subtitle">Transparent t-SNE with synthetic data generation and file uploads</p>
+        </header>
+
+        <div class="tabs">
+            <button class="tab-button active" data-tab="tsne-tab">t-SNE</button>
+            <button class="tab-button" data-tab="upload-tab">Upload</button>
+        </div>
+
+        <!-- Tab 1: t-SNE -->
+        <div id="tsne-tab" class="tab-content active">
+            <!-- Section A: Synthetic Data Generator -->
+            <section class="card">
+                <h2>A) Synthetic Data Generator</h2>
+                <p class="info">Generate n points in d dimensions with k distinct distance types. Optimal: k=1 (n≤d+1 simplex), k=2 (n=5 pentagon), k=3 (n=7 heptagon). Larger n uses approximate lattice constructions.</p>
+
+                <div class="controls">
+                    <div class="control-group">
+                        <label>n (number of points):</label>
+                        <input type="number" id="synth-n" value="6" min="1" max="100">
+                    </div>
+                    <div class="control-group">
+                        <label>d (dimensions):</label>
+                        <input type="number" id="synth-d" value="10" min="1" max="100">
+                    </div>
+                    <div class="control-group">
+                        <label>k (distinct distance types):</label>
+                        <input type="number" id="synth-k" value="2" min="1" step="1">
+                    </div>
+                    <div class="control-group">
+                        <label>seed:</label>
+                        <input type="number" id="synth-seed" value="42" min="0">
+                    </div>
+                </div>
+
+                <button id="generate-btn" class="btn btn-primary">Generate Points</button>
+
+                <div id="synth-output" class="output hidden">
+                    <h3>Generated Points</h3>
+                    <div id="synth-stats"></div>
+                    <div id="synth-table-container"></div>
+                    <h3>Pairwise Distances</h3>
+                    <div id="synth-distances-container"></div>
+                </div>
+            </section>
+
+            <!-- Section B: t-SNE Runner -->
+            <section class="card">
+                <h2>B) t-SNE Runner</h2>
+
+                <div class="controls">
+                    <div class="control-group">
+                        <label>Data Source:</label>
+                        <select id="data-source">
+                            <option value="">-- Select Dataset --</option>
+                            <option value="synthetic">Use Synthetic Points</option>
+                            <option value="load-mnist">Load MNIST Dataset</option>
+                        </select>
+                        <small style="color: #10b981; display: block; margin-top: 5px; font-weight: bold;">✓ v6: tqdm-style progress bars for loading & t-SNE!</small>
+                    </div>
+
+                    <div class="control-group" id="mnist-load-group" style="display: none; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 10px; border: 2px solid #667eea;">
+                        <label style="font-weight: bold; color: #667eea; margin-bottom: 10px; display: block;">📊 MNIST Configuration</label>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                            <div>
+                                <label style="display: block; margin-bottom: 5px; font-size: 0.9em;">Subset:</label>
+                                <select id="mnist-subset" style="width: 100%; padding: 6px;">
+                                    <option value="train">Training Set</option>
+                                    <option value="test">Test Set</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label style="display: block; margin-bottom: 5px; font-size: 0.9em;">Number of Samples:</label>
+                                <input type="number" id="mnist-samples" value="1000" min="100" max="10000" step="100" style="width: 100%; padding: 6px;">
+                            </div>
+                        </div>
+                        <button id="load-mnist-btn" class="btn btn-primary" style="width: 100%; padding: 10px; font-weight: bold;">Load MNIST Dataset</button>
+
+                        <!-- Progress Bar -->
+                        <div id="mnist-progress-container" style="display: none; margin-top: 15px;">
+                            <div style="background: #e5e7eb; border-radius: 8px; height: 24px; overflow: hidden; position: relative;">
+                                <div id="mnist-progress-bar" style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center;">
+                                    <span id="mnist-progress-text" style="color: white; font-size: 0.85em; font-weight: bold; position: absolute; left: 50%; transform: translateX(-50%);"></span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="mnist-status" style="margin-top: 10px; font-size: 0.9em; color: #666; padding: 8px; background: white; border-radius: 4px; display: none;"></div>
+                    </div>
+
+                    <div class="control-group" id="csv-columns-group" style="display: none;">
+                        <label>Select Numeric Columns:</label>
+                        <div id="csv-columns-list"></div>
+                        <div style="margin-top: 5px;">
+                            <label>Handle Missing Values:</label>
+                            <select id="csv-missing">
+                                <option value="drop">Drop rows with NA</option>
+                                <option value="mean">Fill with mean</option>
+                                <option value="zero">Fill with zero</option>
+                            </select>
+                        </div>
+                        <button id="prepare-csv-btn" class="btn btn-secondary">Prepare Dataset</button>
+                    </div>
+
+                    <div class="control-group" id="image-embed-group" style="display: none;">
+                        <label>Embedding Method:</label>
+                        <select id="embed-method">
+                            <option value="hist">Color Histogram (fast)</option>
+                            <option value="clip">CLIP (requires torch/clip)</option>
+                        </select>
+                        <button id="compute-embed-btn" class="btn btn-secondary">Compute Embeddings</button>
+                        <div id="embed-status"></div>
+                    </div>
+
+                    <div class="control-group">
+                        <label>Initialization:</label>
+                        <select id="init-method">
+                            <option value="random">Random</option>
+                            <option value="custom">Custom (User-defined)</option>
+                        </select>
+                    </div>
+
+                    <div class="control-group" id="custom-init-group" style="display: none;">
+                        <label>Custom Initial Coordinates (JSON format):</label>
+                        <textarea id="custom-init-coords" rows="4" placeholder='[[x1, y1], [x2, y2], ...]'></textarea>
+                        <p class="info" style="font-size: 0.85em;">Provide n×2 array of initial 2D coordinates</p>
+                    </div>
+
+                    <div class="control-group">
+                        <label>Perplexity:</label>
+                        <input type="number" id="perplexity" value="30" min="5" max="50">
+                    </div>
+
+                    <div class="control-group">
+                        <label>Learning Rate:</label>
+                        <input type="number" id="learning-rate" value="200" min="10" max="1000">
+                    </div>
+
+                    <div class="control-group">
+                        <label>Iterations:</label>
+                        <input type="number" id="iterations" value="1000" min="100" max="5000">
+                    </div>
+
+                    <div class="control-group">
+                        <label>Early Exaggeration:</label>
+                        <input type="number" id="early-exag" value="12" min="1" max="50">
+                    </div>
+
+                    <div class="control-group">
+                        <label>Momentum:</label>
+                        <input type="number" id="momentum" value="0.8" min="0" max="1" step="0.1">
+                    </div>
+
+                    <div class="control-group">
+                        <label>Seed:</label>
+                        <input type="number" id="tsne-seed" value="42" min="0">
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button id="run-tsne-btn" class="btn btn-primary">Run t-SNE</button>
+                    <button id="stop-tsne-btn" class="btn btn-danger" style="display: none;">Stop</button>
+                </div>
+
+                <div id="progress-container" class="progress-container hidden">
+                    <div style="background: #e5e7eb; border-radius: 8px; height: 24px; overflow: hidden; position: relative;">
+                        <div id="progress-bar" style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center;">
+                            <span id="progress-text" style="color: white; font-size: 0.85em; font-weight: bold; position: absolute; left: 50%; transform: translateX(-50%);">Initializing...</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Section C: Outputs & Internals -->
+            <section class="card" id="results-section" style="display: none;">
+                <h2>C) Outputs & Internals</h2>
+
+                <div class="results-grid">
+                    <!-- 2D Scatter Plot -->
+                    <div class="result-box">
+                        <h3>2D t-SNE Result</h3>
+                        <div id="tsne-plot"></div>
+                    </div>
+
+                    <!-- Cluster Results (for MNIST/Images) - REMOVED -->
+                    <div class="result-box" id="cluster-results-box" style="display: none !important;">
+                        <h3>Cluster Distribution</h3>
+                        <div id="cluster-summary" style="min-height: 200px;">
+                            <p style="color: #999; text-align: center; padding: 40px;">Run t-SNE to see cluster results</p>
+                        </div>
+                    </div>
+
+                    <!-- Cost over iterations -->
+                    <div class="result-box">
+                        <h3>Cost (KL Divergence) Over Iterations</h3>
+                        <div id="cost-plot"></div>
+                    </div>
+
+                    <!-- P matrix heatmap -->
+                    <div class="result-box">
+                        <h3>P Matrix (High-D Affinities)</h3>
+                        <div class="button-group">
+                            <button class="btn btn-secondary" onclick="toggleMatrixView('P', 'heatmap')">Heatmap</button>
+                            <button class="btn btn-secondary" onclick="toggleMatrixView('P', 'grid')">Grid View</button>
+                            <button class="btn btn-secondary" onclick="downloadMatrix('P')">Download CSV</button>
+                        </div>
+                        <div id="p-matrix-plot"></div>
+                        <div id="p-matrix-grid" style="display: none;"></div>
+                    </div>
+
+                    <!-- Q matrix heatmap -->
+                    <div class="result-box">
+                        <h3>Q Matrix (Low-D Affinities)</h3>
+                        <div class="button-group">
+                            <button class="btn btn-secondary" onclick="toggleMatrixView('Q', 'heatmap')">Heatmap</button>
+                            <button class="btn btn-secondary" onclick="toggleMatrixView('Q', 'grid')">Grid View</button>
+                            <button class="btn btn-secondary" onclick="downloadMatrix('Q')">Download CSV</button>
+                        </div>
+                        <div id="q-matrix-plot"></div>
+                        <div id="q-matrix-grid" style="display: none;"></div>   
+                    </div>
+
+                    <!-- Y distances heatmap -->
+                    <div class="result-box">
+                        <h3>Distances Between y<sub>i</sub> (Embedding)</h3>
+                        <div class="button-group">
+                            <button class="btn btn-secondary" onclick="toggleMatrixView('D', 'heatmap')">Heatmap</button>
+                            <button class="btn btn-secondary" onclick="toggleMatrixView('D', 'grid')">Grid View</button>
+                            <button class="btn btn-secondary" onclick="downloadMatrix('D')">Download CSV</button>
+                        </div>
+                        <div id="d-matrix-plot"></div>
+                        <div id="d-matrix-grid" style="display: none;"></div>
+                    </div>
+
+                    <!-- Coordinates table -->
+                    <div class="result-box">
+                        <h3>2D Coordinates</h3>
+                        <div id="coords-table"></div>
+                    </div>
+
+                    <!-- Clustering -->
+                    <div class="result-box" id="clustering-section" style="display: none;">
+                        <h3>Clustering</h3>
+                        <div class="controls">
+                            <div class="control-group">
+                                <label>Method:</label>
+                                <select id="cluster-method">
+                                    <option value="kmeans">K-Means</option>
+                                    <option value="dbscan">DBSCAN</option>
+                                </select>
+                            </div>
+                            <div class="control-group" id="kmeans-params">
+                                <label>k (clusters):</label>
+                                <input type="number" id="kmeans-k" value="3" min="2" max="10">
+                            </div>
+                            <div class="control-group hidden" id="dbscan-params">
+                                <label>eps:</label>
+                                <input type="number" id="dbscan-eps" value="0.5" min="0.1" step="0.1">
+                                <label>min_samples:</label>
+                                <input type="number" id="dbscan-minsamples" value="5" min="1">
+                            </div>
+                        </div>
+                        <button id="run-cluster-btn" class="btn btn-primary">Run Clustering</button>
+                        <div id="cluster-summary"></div>
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button id="export-btn" class="btn btn-primary">Export Results (CSV)</button>
+                </div>
+            </section>
+        </div>
+
+        <!-- Tab 2: Upload -->
+        <div id="upload-tab" class="tab-content">
+            <section class="card">
+                <h2>Upload Data</h2>
+
+                <div class="upload-section">
+                    <h3>CSV Files</h3>
+                    <input type="file" id="csv-upload" accept=".csv" multiple>
+                    <button id="csv-upload-btn" class="btn btn-primary">Upload CSV</button>
+                </div>
+
+                <div class="upload-section">
+                    <h3>Images</h3>
+                    <p class="info">Upload individual images or an entire folder</p>
+                    <input type="file" id="image-upload" accept="image/*" multiple>
+                    <input type="file" id="folder-upload" webkitdirectory directory multiple style="display: none;">
+                    <div class="button-group">
+                        <button id="image-upload-btn" class="btn btn-primary">Upload Images</button>
+                        <button id="folder-upload-btn" class="btn btn-primary">Upload Folder</button>
+                    </div>
+                </div>
+
+                <div id="upload-list" class="upload-list">
+                    <h3>Uploaded Datasets</h3>
+                    <div id="datasets-container"></div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Image Preview Modal -->
+        <div id="image-modal" class="modal hidden">
+            <div class="modal-content">
+                <span class="modal-close">&times;</span>
+                <h3 id="modal-title"></h3>
+                <img id="modal-image" src="" alt="Preview">
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
