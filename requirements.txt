@@ -1,6 +1,7 @@
 numpy
 pandas
-streamlit
+streamlit==1.53.1
+altair>=5.5,<7
 scikit-learn
 matplotlib
 plotly
